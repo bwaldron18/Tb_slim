@@ -1,0 +1,264 @@
+// Recipe 13.2 modified
+
+// MODIFIED RECIPE TO RECORD Tb AND Topt VARIANCES ACROSS INDIVIDUALS
+// Tb-genetic-REG2-005-high
+// Modified the code to simply calculate variance along with means, and write to separate file
+// Also changed sampling to record every 100 gen (instead of every 1000)
+
+
+// Add Rezende TPC equations
+// function to calculate Tth (from a given Topt, which are our evolving phenotypes)
+function (numeric)getTth(numeric Topt, numeric Q10, numeric d)
+{
+	Tth = Topt + 10.0/log(Q10) - sqrt( (1.0/d) + (10.0/log(Q10))^2.0);
+	return Tth;
+}
+
+// get performance at given temperature (x) - note slim is particular about including decimal
+function (numeric)tpc(numeric x, numeric Tth, numeric Q10, numeric d, numeric C)
+{
+	pf = rep(0.0, length(x));
+	pf[x < Tth] = C*exp(x[x < Tth]*log(Q10)/10.0);
+	// if only one Tth provided
+	if (length(Tth) == 1){
+		pf[x >= Tth] = C*exp(x[x >= Tth]*log(Q10)/10.0) * (1.0 - ( d*(x[x>=Tth]-Tth)^2.0) );
+	}
+	// if vector of Tth provided
+	if (length(Tth) > 1){
+		pf[x >= Tth] = C*exp(x[x >= Tth]*log(Q10)/10.0) * (1.0 - ( d*(x[x>=Tth]-Tth[x>=Tth])^2.0) );
+	}
+	pf[pf < 0.0] = 0.0;
+	return pf;
+}
+
+// Rescale a performance curve by a Topt to a performance max=1.0
+function (numeric)pfScaled(numeric pfs, numeric Topt, numeric Tth, numeric Q10, numeric d, numeric C)
+{
+	maxPf = tpc(Topt, Tth, Q10, d, C);
+	scaledPfs = pfs / maxPf;
+	return(scaledPfs);
+}
+
+//// function to calculate Topt
+//function (float)Topt(float Tth, float Q10, float d)
+//{
+//	Topt = Tth - 10.0/log(Q10) + sqrt(1.0/d + (10.0/log(Q10))^2.0);
+//	return Topt;
+//}
+
+// intialize
+initialize() {
+	// set working directory
+	if (exists("slimgui"))
+		setwd("C:\\Users\\brian\\Dropbox\\Projects\\017_SLiM_templeton\\analyses\\Tb_Variance\\");
+	else setwd("./");
+	/// DEFINE CONSTANTS ///
+	if (!exists("G")) defineConstant("G", 100000); // total generations
+	// population features
+	if (!exists("POP")) defineConstant("POP", 1);   // number of populations (VERIFY FUNCTIONALITY WITH >1)
+	if (!exists("N")) defineConstant("N", 500);     // individuals per population	
+	// locus features
+	if (!exists("MU")) defineConstant("MU", 1e-7);  // mutation rate
+	if (!exists("R")) defineConstant("R", 1e-8);   // recombination rate
+	if (!exists("NPR")) defineConstant("NPR", 1);    // number of protein-coding loci (not counting the Tb locus)
+	if (!exists("LEN")) defineConstant("LEN", 1000); // locus length
+	//defineConstant("INT", 10000);  // interval between protein-coding loci (*replaced with free recombination between proteins)
+	if (!exists("NTB")) defineConstant("NTB", 1); // Number of Body temperature (Tb) loci
+	if (!exists("TBL")) defineConstant("TBL", 1000); // Body temperature (Tb) locus length
+	// QTL-related constants 
+	if (!exists("QTL_mu")) defineConstant("QTL_mu", 0.0);     // average mutation effect size
+	if (!exists("QTL_sigma")) defineConstant("QTL_sigma", 0.1);	// SD of mutation effect sizes
+	// Provide an start point and optimum for Tb 
+	if (!exists("TBSTART")) defineConstant("TBSTART", 34.8);
+	if (!exists("TBOPT")) defineConstant("TBOPT", 34.8);
+	// Provide distribution of start points and optima for protein-coding loci
+	if (!exists("PROTSTART")) defineConstant("PROTSTART", runif(NPR, 34.8, 34.8));
+	//if (!exists("PROTOPT")) defineConstant("PROTOPT", runif(NPR, 37.0, 37.0));
+	// Provide a starting environmental T, and an amount of change to a new temperature (delta Tenv)
+	if (!exists("TENVMODEL")) defineConstant("TENVMODEL", T); // use model with Tenv: T/F
+	if (!exists("TENV")) defineConstant("TENV", 34.8);
+	if (!exists("DT")) defineConstant("DT", 1); // set the shift in TENV
+	// ID for logfile
+	if (!exists("simID")) defineConstant("simID", "P"+NPR+"_M"+MU);
+	// Thermal Performance Curve (TPC) parameters
+	//if (!exists("Tth")) defineConstant("TPC_Tth", 17.45);
+	if (!exists("TPC_Q10")) defineConstant("TPC_Q10", 2.356); // 2.5
+	if (!exists("TPC_d")) defineConstant("TPC_d", 0.0016);  // 0.0016
+	if (!exists("TPC_C")) defineConstant("TPC_C", 0.129);  // 0.129
+	// repeat for proteins 
+	if (!exists("TPC_P_Q10")) defineConstant("TPC_P_Q10", 1.183);
+	if (!exists("TPC_P_d")) defineConstant("TPC_P_d", 0.0013);
+	if (!exists("TPC_P_C")) defineConstant("TPC_P_C", 5.77);
+	// "cost of thermoregulation" fintess fucntion SD
+	if (!exists("COST_SD")) defineConstant("COST_SD", 1.0);
+	/// INITIALIZE RUN ///
+	initializeMutationRate(MU);
+	
+	// set recombination rates; proteins unlinked
+	rates = c(rep(c(R, 0.5), NPR), rep(c(R, 0.5), NTB-1), R); // R within each protein, followed immediately by 0.5 for free recombination; R separates Tb loci; repeat
+	ends=NULL;
+	for (index in 1:(NPR)) {
+		ends = c(ends, asInteger(index*LEN - 1));
+		ends = c(ends, asInteger(index*LEN));
+	}
+	for (index in 1:NTB) {
+		ends = c(ends, asInteger( (NPR*LEN)+ index*TBL - 1));
+		ends = c(ends, asInteger( (NPR*LEN)+ index*TBL));
+	}
+	ends = ends[0: (((NPR*2)+(NTB*2))-2)];
+	//ends = c(ends, (NPR*LEN) + (NTB*TBL-1) ); // add one additional end for our Tb locus
+	initializeRecombinationRate(rates = rates, ends = ends);
+	
+	
+	// MUTATION TYPES
+	// mutation type for body temperature
+	initializeMutationType("m0", 0.5, "n", QTL_mu, QTL_sigma);
+	m0.convertToSubstitution = F;
+	// mutation type for each protein
+	for (type_id in 1:NPR)
+	{
+		muttype = initializeMutationType(type_id, 0.5, "n", QTL_mu, QTL_sigma);
+		muttype.convertToSubstitution = F;
+	}
+	//// neutral mutations	
+	//initializeMutationType(NPR+1, 0.5, "f", 0.0);
+	
+	// GENOMIC ELEMENT TYPES
+	// g0 is the body temperature locus (Tb); all others are a QTL
+	initializeGenomicElementType("g0", c(m0), 1.0);
+	// initialize GET
+	for (index in 1:NPR) {
+		initializeGenomicElementType(index, index, 1.0);
+	}
+	//// add a neutral region type
+	//initializeGenomicElementType(NPR+1, NPR+1, 1.0);
+	
+	// GENOMIC ELEMENTS
+	// protein-coding loci
+	for (index in 0:(NPR-1)) {
+		initializeGenomicElement(index+1, (index*LEN), ((index*LEN) + (LEN-1)) );
+	
+	}
+	// Tb region - there are NTB independent loci for Tb, even though one Tb color displays chromosome panel,
+	// because all loci for Tb specified by element type 'g0'
+	initializeGenomicElement(g0, (NPR*LEN), (NPR*LEN) + (NTB*TBL) - 1 );
+}
+
+
+
+/// Set up populations; remove fitness effects for m0 and m1..mn
+mutationEffect(m0) { return 1.0; }
+1 early() {
+	// set simulation to end in G generations
+	community.rescheduleScriptBlock(s1, start=G, end=G);
+	// add subpop(s)
+	for (i in 1:POP)	{
+		sim.addSubpop(i, N);
+	}
+	// loop through mutation types and give each fitness effect of 1.0
+	for (type_id in 1:NPR)
+		sim.registerMutationEffectCallback(NULL, "{ return 1.0; }", type_id);
+}
+
+//1:49999 late(){
+//	inds = sim.subpopulations.individuals;
+//	tbPhenotype = 	TBSTART + inds.sumOfMutationsOfType(m0);
+//	if (exists("slimgui") & sim.cycle % 1000 == 0){
+//		catn("Mean phenotype Tb " + mean(tbPhenotype));
+//	}
+//}
+
+
+/// Sum up phenotypes; get fitness effects across quantitative traits
+1: late() {
+	
+	// Let TBE be selection resulting from Tenv; midway through simulation, change Tenv
+	if (sim.cycle < G*0.1)
+		TBE = TENV;
+	else
+		TBE = TENV + DT; 	// make sure to set DT constant to 0 if no shift desired 	
+	
+	// write a file logging cycle number, Tb phenotpye, and protein phenotypes
+	if (sim.cycle == 1){
+		// delete file if it exists
+		if (fileExists("sim_log_"+simID+".txt"))
+		{
+			deleteFile("sim_log_"+simID+".txt");
+		}
+		// write column names
+		writeFile("sim_log_"+simID+".txt", paste(c("cycle", "RF", "Tb", c( "Topt" + seq(1,NPR))), sep=","), append=T);
+		writeFile("sim_Variance_"+simID+".txt", paste(c("cycle", "RF", "Tb", c( "Topt" + seq(1,NPR))), sep=","), append=T);
+
+	}
+	
+	// get individuals
+	inds = sim.subpopulations.individuals;
+	// Tb phenotype - *assuming Tb phenotype is equivalent to Topt
+	tbPhenotype = 	TBSTART + inds.sumOfMutationsOfType(m0);
+	//Tth = getTth(Topt=tbPhenotype, Q10=TPC_Q10, d=TPC_d);
+	
+	// Print every 1000 generations...
+	if (exists("slimgui") & sim.cycle % 1000 == 0){ catn("Generation: " + sim.cycle);}
+	
+	// For each protein mutation type (i.e. locus):	
+	for (type_id in 1:NPR)
+	{
+		// sum up QTL effects to get phenotype (i.e. locus' trait value - Topt,i)
+		phenotypes = PROTSTART[type_id-1] + inds.sumOfMutationsOfType(type_id);
+		
+		// use phenotype (Topt,i) to get Tth for each TPC
+		Tthi = getTth(Topt=phenotypes, Q10=TPC_P_Q10, d=TPC_P_d);
+		
+		// Get each TPC
+		pf = tpc(tbPhenotype, Tth=Tthi, Q10=TPC_P_Q10, d=TPC_P_d, C=TPC_P_C);
+		
+		// Scale the TPC to 1.0 for maximum possible performance
+		effectsDif = pfScaled(pf, Topt = phenotypes, Tth=Tthi, Q10=TPC_P_Q10, d=TPC_P_d, C=TPC_P_C); // deleted "*10"
+		
+		// Modify inividual fitness 
+		inds.fitnessScaling = inds.fitnessScaling * effectsDif; //* effectsLoc;
+		
+		// Every 1000 gen, print phenotypes and difference from Tenv
+		if (exists("slimgui") & sim.cycle % 1000 == 0){
+			catn("Mean protein " + type_id + ": " + mean(phenotypes) +
+				"\t[DEV: " + (mean(phenotypes) - TBE) + "]");
+			//catn("Difference " + type_id + ": "  + (mean(phenotypes) - PROTOPT[type_id-1]));
+		}
+	}
+	
+	// now add in selection from TENV if using this model
+	if (TENVMODEL == T){
+		
+		// calculate "cost of thermoregulation" using normally-distributed fitness function
+		effectsDif = dnorm(tbPhenotype, rep(TBE, length(tbPhenotype)), COST_SD) / dnorm(tbPhenotype, tbPhenotype, COST_SD);
+
+		// scale inividual fitness (adjust by NPR)
+		inds.fitnessScaling = inds.fitnessScaling * (effectsDif);
+	}
+	
+	// Every 1000 gen, print Tb phenotypes and difference from Tenv
+	if (exists("slimgui") & sim.cycle % 1000 == 0){
+		catn("Mean phenotype Tb " + mean(tbPhenotype) +
+			"\t[DEV: " + (mean(tbPhenotype) - TBE) + "]\n");
+		//catn("Difference Tb " + (mean(tbPhenotype) - TBOPT) + "\n" );
+	}
+	
+	// log data to file every 100 gens
+	if (sim.cycle % 100 == 0){
+		meanProtein = NULL;
+		varProtein = NULL;
+		for (type_id in 1:NPR){
+			phenotypes = PROTSTART[type_id-1] + inds.sumOfMutationsOfType(type_id);
+			meanProtein = c(meanProtein, mean(phenotypes));
+			varProtein = c(varProtein, var(phenotypes));
+		}
+		writeFile("sim_log_"+simID+".txt", paste(c(sim.cycle, mean(inds.fitnessScaling), mean(tbPhenotype), meanProtein), sep=","), append=T);
+		writeFile("sim_Variance_"+simID+".txt", paste(c(sim.cycle, var(inds.fitnessScaling), var(tbPhenotype), varProtein), sep=","), append=T);
+	}
+}
+
+/// END SIMULATION /// 
+// THIS CALLBACK DOES NOTHING; ALLOWS 'G' TO SPECIFY NUMBER OF GENERATIONS
+s1 1 late() {}
+
+
